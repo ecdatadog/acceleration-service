@@ -251,36 +251,61 @@ func (rc *RemoteCache) Fetch(ctx context.Context, platformMC platforms.MatchComp
 			if err != nil {
 				return nil, errors.Wrap(err, "read remote cache manifest")
 			}
-			if targetManifest.Annotations[LayerAnnotationCacheVersion] != rc.version {
-				logrus.WithError(err).Warnf("ignore cache %s, unmatched version: %s, expected: %s", rc.Ref,
-					targetManifest.Annotations[LayerAnnotationCacheVersion], rc.version)
-				continue
-			}
 			targetManifests = append(targetManifests, targetManifest)
 		}
 		for _, manifest := range targetManifests {
-			for _, targetDesc := range manifest.Layers {
-				sourceDigest := digest.Digest(targetDesc.Annotations[nydusify.LayerAnnotationNydusSourceDigest])
-				if err := sourceDigest.Validate(); err != nil {
-					logrus.WithError(err).Warnf("invalid cache layer digest record: %s", sourceDigest)
-					continue
-				}
-				reader, sourceDesc, err := fetcher.(remotes.FetcherByDigest).FetchByDigest(ctx, sourceDigest)
-				if err != nil {
-					return nil, errors.Wrap(err, "read remote cache manifest")
-				}
-				reader.Close()
-				if targetDesc.Annotations == nil {
-					targetDesc.Annotations = map[string]string{}
-				}
-				targetDesc.Annotations[nydusify.LayerAnnotationUncompressed] = string(targetDesc.Digest)
-				rc.set(sourceDesc, targetDesc)
+			if err := rc.importManifestRecords(ctx, fetcher, manifest); err != nil {
+				return nil, err
 			}
 		}
 		return manifestIndexDesc, nil
+	case images.MediaTypeDockerSchema2Manifest, ocispec.MediaTypeImageManifest:
+		manifest := ocispec.Manifest{}
+		if err = json.Unmarshal(mBytes, &manifest); err != nil {
+			return nil, errors.Wrap(err, "unmarshal remote cache manifest")
+		}
+		if err = content.WriteBlob(ctx, rc.provider.ContentStore(), rc.Ref, bytes.NewReader(mBytes), desc); err != nil {
+			return nil, errors.Wrap(err, "write remote cache manifest")
+		}
+		if err := rc.importManifestRecords(ctx, fetcher, manifest); err != nil {
+			return nil, err
+		}
+		return &desc, nil
 	default:
 		return nil, fmt.Errorf("unsupported cache image mediatype %s", desc.MediaType)
 	}
+}
+
+func (rc *RemoteCache) importManifestRecords(ctx context.Context, fetcher remotes.Fetcher, manifest ocispec.Manifest) error {
+	if manifest.Annotations[LayerAnnotationCacheVersion] != rc.version {
+		logrus.Warnf("ignore cache %s, unmatched version: %s, expected: %s", rc.Ref,
+			manifest.Annotations[LayerAnnotationCacheVersion], rc.version)
+		return nil
+	}
+
+	fetcherByDigest, ok := fetcher.(remotes.FetcherByDigest)
+	if !ok {
+		return errors.New("remote cache fetcher does not support fetch by digest")
+	}
+
+	for _, targetDesc := range manifest.Layers {
+		sourceDigest := digest.Digest(targetDesc.Annotations[nydusify.LayerAnnotationNydusSourceDigest])
+		if err := sourceDigest.Validate(); err != nil {
+			logrus.WithError(err).Warnf("invalid cache layer digest record: %s", sourceDigest)
+			continue
+		}
+		reader, sourceDesc, err := fetcherByDigest.FetchByDigest(ctx, sourceDigest)
+		if err != nil {
+			return errors.Wrap(err, "read remote cache manifest")
+		}
+		reader.Close()
+		if targetDesc.Annotations == nil {
+			targetDesc.Annotations = map[string]string{}
+		}
+		targetDesc.Annotations[nydusify.LayerAnnotationUncompressed] = string(targetDesc.Digest)
+		rc.set(sourceDesc, targetDesc)
+	}
+	return nil
 }
 
 // Push merges local and remote cache records, then push cache manifest to remote registry.
@@ -290,70 +315,63 @@ func (rc *RemoteCache) Push(ctx context.Context, orgDesc, newDesc *ocispec.Descr
 	if err != nil && !errors.Is(err, ctrErrdefs.ErrNotFound) {
 		return err
 	}
-	cacheIndex, err := rc.update(ctx, orgDesc, newDesc, cacheDesc, platformMC)
+	cacheDesc, manifests, err := rc.update(ctx, orgDesc, newDesc, cacheDesc, platformMC)
 	if err != nil {
 		return err
 	}
-	for _, manifest := range cacheIndex.Manifests {
+	for _, manifest := range manifests {
 		if err := rc.provider.Push(ctx, manifest, rc.Ref); err != nil {
 			return err
 		}
 	}
-	manifestIndexDesc, manifestIndexBytes, err := nydusutils.MarshalToDesc(*cacheIndex, ocispec.MediaTypeImageIndex)
-	if err != nil {
-		return errors.Wrap(err, "marshal remote cache manifest index")
-	}
-	if err = content.WriteBlob(ctx, rc.provider.ContentStore(), rc.Ref, bytes.NewReader(manifestIndexBytes), *manifestIndexDesc); err != nil {
-		return errors.Wrap(err, "write remote cache manifest index")
-	}
-	return rc.provider.Push(ctx, *manifestIndexDesc, rc.Ref)
+	return rc.provider.Push(ctx, *cacheDesc, rc.Ref)
 }
 
 // update updates cache manifests, it preferentially keep the lower layers if the cache capacity is full.
 func (rc *RemoteCache) update(ctx context.Context, orgDesc, newDesc, cacheDesc *ocispec.Descriptor,
-	platformMC platforms.MatchComparer) (*ocispec.Index, error) {
+	platformMC platforms.MatchComparer) (*ocispec.Descriptor, []ocispec.Descriptor, error) {
 	targetLayersByPlatform := map[*platforms.Platform][]ocispec.Descriptor{}
 
 	switch orgDesc.MediaType {
 	case ocispec.MediaTypeImageManifest, images.MediaTypeDockerSchema2Manifest:
 		targetLayers, err := rc.getTargetLayers(ctx, rc.provider.ContentStore(), *orgDesc)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		// platform of original or new image maybe lost, get from config platform
 		platform, err := images.Platforms(ctx, rc.provider.ContentStore(), *orgDesc)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		targetLayersByPlatform[&platform[0]] = targetLayers
 
 	case images.MediaTypeDockerSchema2ManifestList, ocispec.MediaTypeImageIndex:
 		orgManifests, err := utils.GetManifests(ctx, rc.provider.ContentStore(), *orgDesc, platformMC)
 		if err != nil {
-			return nil, errors.Wrap(err, "get source manifest list")
+			return nil, nil, errors.Wrap(err, "get source manifest list")
 		}
 		newManifests, err := utils.GetManifests(ctx, rc.provider.ContentStore(), *newDesc, platformMC)
 		if err != nil {
-			return nil, errors.Wrap(err, "get new manifest list")
+			return nil, nil, errors.Wrap(err, "get new manifest list")
 		}
 		for _, newManifestDesc := range newManifests {
 			targetLayers := []ocispec.Descriptor{}
 			newManiPlatforms, err := images.Platforms(ctx, rc.provider.ContentStore(), newManifestDesc)
 			if err != nil {
-				return nil, errors.Wrap(err, "get converted manifest platforms")
+				return nil, nil, errors.Wrap(err, "get converted manifest platforms")
 			}
 			// find original manifest matches converted manifest's platform
 			matcher := platforms.NewMatcher(newManiPlatforms[0])
 			for _, orgManifestDesc := range orgManifests {
 				orgManiPlatforms, err := images.Platforms(ctx, rc.provider.ContentStore(), orgManifestDesc)
 				if err != nil {
-					return nil, errors.Wrap(err, "get original manifest platforms")
+					return nil, nil, errors.Wrap(err, "get original manifest platforms")
 				}
 
 				if matcher.Match(orgManiPlatforms[0]) {
 					targetLayers, err = rc.getTargetLayers(ctx, rc.provider.ContentStore(), orgManifestDesc)
 					if err != nil {
-						return nil, err
+						return nil, nil, err
 					}
 					break
 				}
@@ -365,10 +383,10 @@ func (rc *RemoteCache) update(ctx context.Context, orgDesc, newDesc, cacheDesc *
 	imageConfig := ocispec.ImageConfig{}
 	imageConfigDesc, imageConfigBytes, err := nydusutils.MarshalToDesc(imageConfig, ocispec.MediaTypeImageConfig)
 	if err != nil {
-		return nil, errors.Wrap(err, "marshal remote cache image config")
+		return nil, nil, errors.Wrap(err, "marshal remote cache image config")
 	}
 	if err = content.WriteBlob(ctx, rc.provider.ContentStore(), rc.Ref, bytes.NewReader(imageConfigBytes), *imageConfigDesc); err != nil {
-		return nil, errors.Wrap(err, "write remote cahce image config")
+		return nil, nil, errors.Wrap(err, "write remote cahce image config")
 	}
 
 	cacheIndex := ocispec.Index{
@@ -380,37 +398,64 @@ func (rc *RemoteCache) update(ctx context.Context, orgDesc, newDesc, cacheDesc *
 	}
 	// cacheDesc maybe nil if remote cache doesn't exists before
 	if cacheDesc != nil {
-		_, err = utils.ReadJSON(ctx, rc.provider.ContentStore(), &cacheIndex, *cacheDesc)
-		if err != nil {
-			return nil, errors.Wrap(err, "read cache manifest index")
-		}
-		for idx, maniDesc := range cacheIndex.Manifests {
-			matcher := platforms.NewMatcher(*maniDesc.Platform)
-			for platform, layers := range targetLayersByPlatform {
-				if matcher.Match(*platform) {
-					// append new cache layers to existed cache manifest
-					var manifest ocispec.Manifest
-					_, err = utils.ReadJSON(ctx, rc.provider.ContentStore(), &manifest, maniDesc)
-					if err != nil {
-						return nil, errors.Wrap(err, "read cache manifest")
-					}
+		switch cacheDesc.MediaType {
+		case ocispec.MediaTypeImageManifest, images.MediaTypeDockerSchema2Manifest:
+			if len(targetLayersByPlatform) == 1 {
+				var manifest ocispec.Manifest
+				_, err = utils.ReadJSON(ctx, rc.provider.ContentStore(), &manifest, *cacheDesc)
+				if err != nil {
+					return nil, nil, errors.Wrap(err, "read cache manifest")
+				}
+				for platform, layers := range targetLayersByPlatform {
 					manifest.Layers = appendLayers(manifest.Layers, layers, rc.size)
-					// append LayerAnnotationCacheVersion to manifest annotations
 					if manifest.Annotations == nil {
 						manifest.Annotations = map[string]string{}
 					}
 					manifest.Annotations[LayerAnnotationCacheVersion] = rc.version
-					newManiDesc, err := utils.WriteJSON(ctx, rc.provider.ContentStore(), manifest, maniDesc, "", nil)
+					newManiDesc, err := utils.WriteJSON(ctx, rc.provider.ContentStore(), manifest, *cacheDesc, "", nil)
 					if err != nil {
-						return nil, errors.Wrap(err, "write cache manifest")
+						return nil, nil, errors.Wrap(err, "write cache manifest")
 					}
-					cacheIndex.Manifests[idx] = *newManiDesc
-					delete(targetLayersByPlatform, platform)
+					newManiDesc.Platform = platform
+					return newManiDesc, nil, nil
 				}
 			}
+		case ocispec.MediaTypeImageIndex, images.MediaTypeDockerSchema2ManifestList:
+			_, err = utils.ReadJSON(ctx, rc.provider.ContentStore(), &cacheIndex, *cacheDesc)
+			if err != nil {
+				return nil, nil, errors.Wrap(err, "read cache manifest index")
+			}
+			for idx, maniDesc := range cacheIndex.Manifests {
+				matcher := platforms.NewMatcher(*maniDesc.Platform)
+				for platform, layers := range targetLayersByPlatform {
+					if matcher.Match(*platform) {
+						// append new cache layers to existed cache manifest
+						var manifest ocispec.Manifest
+						_, err = utils.ReadJSON(ctx, rc.provider.ContentStore(), &manifest, maniDesc)
+						if err != nil {
+							return nil, nil, errors.Wrap(err, "read cache manifest")
+						}
+						manifest.Layers = appendLayers(manifest.Layers, layers, rc.size)
+						// append LayerAnnotationCacheVersion to manifest annotations
+						if manifest.Annotations == nil {
+							manifest.Annotations = map[string]string{}
+						}
+						manifest.Annotations[LayerAnnotationCacheVersion] = rc.version
+						newManiDesc, err := utils.WriteJSON(ctx, rc.provider.ContentStore(), manifest, maniDesc, "", nil)
+						if err != nil {
+							return nil, nil, errors.Wrap(err, "write cache manifest")
+						}
+						cacheIndex.Manifests[idx] = *newManiDesc
+						delete(targetLayersByPlatform, platform)
+					}
+				}
+			}
+		default:
+			return nil, nil, fmt.Errorf("unsupported cache image mediatype %s", cacheDesc.MediaType)
 		}
 	}
 
+	newManifests := []ocispec.Descriptor{}
 	// append new cache layers to new cache manifest
 	for platform, layers := range targetLayersByPlatform {
 		manifest := ocispec.Manifest{
@@ -424,18 +469,29 @@ func (rc *RemoteCache) update(ctx context.Context, orgDesc, newDesc, cacheDesc *
 				LayerAnnotationCacheVersion: rc.version,
 			},
 		}
-		manifestDesc, err := utils.WriteJSON(ctx, rc.provider.ContentStore(), manifest, ocispec.Descriptor{}, "", nil)
-		if err != nil {
-			return nil, errors.Wrap(err, "write cache manifest")
-		}
-		cacheIndex.Manifests = append(cacheIndex.Manifests, ocispec.Descriptor{
+		manifestDesc, err := utils.WriteJSON(ctx, rc.provider.ContentStore(), manifest, ocispec.Descriptor{
 			MediaType: ocispec.MediaTypeImageManifest,
-			Digest:    manifestDesc.Digest,
-			Size:      manifestDesc.Size,
 			Platform:  platform,
-		})
+		}, "", nil)
+		if err != nil {
+			return nil, nil, errors.Wrap(err, "write cache manifest")
+		}
+		newManifests = append(newManifests, *manifestDesc)
 	}
-	return &cacheIndex, nil
+
+	if cacheDesc == nil && len(newManifests) == 1 {
+		return &newManifests[0], nil, nil
+	}
+
+	cacheIndex.Manifests = append(cacheIndex.Manifests, newManifests...)
+	manifestIndexDesc, manifestIndexBytes, err := nydusutils.MarshalToDesc(cacheIndex, ocispec.MediaTypeImageIndex)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "marshal remote cache manifest index")
+	}
+	if err = content.WriteBlob(ctx, rc.provider.ContentStore(), rc.Ref, bytes.NewReader(manifestIndexBytes), *manifestIndexDesc); err != nil {
+		return nil, nil, errors.Wrap(err, "write remote cache manifest index")
+	}
+	return manifestIndexDesc, cacheIndex.Manifests, nil
 }
 
 // getTargetLayers gets cached target layers
