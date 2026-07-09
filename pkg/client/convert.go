@@ -3,6 +3,7 @@ package client
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 
@@ -35,10 +36,15 @@ func (client *Client) CreateTask(src string, sync bool) (*model.CreateTaskRespon
 	}
 	defer resp.Body.Close()
 
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, errors.Wrap(err, "read response body")
+	}
+
+	// Support both new server (JSON object response) and old server ("Ok" string response).
 	var result model.CreateTaskResponse
-	decoder := json.NewDecoder(resp.Body)
-	if err := decoder.Decode(&result); err != nil {
-		return nil, errors.Wrap(err, "decode response")
+	if err := json.Unmarshal(body, &result); err != nil || len(result.Tasks) == 0 {
+		return &model.CreateTaskResponse{}, nil
 	}
 
 	return &result, nil
