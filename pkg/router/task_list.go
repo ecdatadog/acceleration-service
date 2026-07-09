@@ -25,3 +25,15 @@ func (r *LocalRouter) ListTask(ctx echo.Context) error {
 	tasks := task.Manager.List()
 	return ctx.JSON(http.StatusOK, tasks)
 }
+
+func (r *LocalRouter) GetTask(ctx echo.Context) error {
+	id := ctx.Param("id")
+	t := task.Manager.Get(id)
+	if t == nil {
+		return ctx.JSON(http.StatusNotFound, map[string]string{
+			"code":    "ERR_TASK_NOT_FOUND",
+			"message": "task not found",
+		})
+	}
+	return ctx.JSON(http.StatusOK, t)
+}
