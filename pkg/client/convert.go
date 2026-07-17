@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/goharbor/acceleration-service/pkg/model"
 	"github.com/goharbor/acceleration-service/pkg/task"
@@ -42,9 +43,13 @@ func (client *Client) CreateTask(src string, sync bool) (*model.CreateTaskRespon
 	}
 
 	// Support both new server (JSON object response) and old server ("Ok" string response).
-	var result model.CreateTaskResponse
-	if err := json.Unmarshal(body, &result); err != nil || len(result.Tasks) == 0 {
+	if strings.TrimSpace(string(body)) == "Ok" {
 		return &model.CreateTaskResponse{}, nil
+	}
+
+	var result model.CreateTaskResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, errors.Wrap(err, "unmarshal response body")
 	}
 
 	return &result, nil
@@ -57,10 +62,6 @@ func (client *Client) GetTask(id string) (*task.Task, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("task %s not found", id)
-	}
 
 	var t task.Task
 	decoder := json.NewDecoder(resp.Body)

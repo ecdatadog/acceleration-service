@@ -17,6 +17,8 @@ package router
 import (
 	"net/http"
 
+	"github.com/goharbor/acceleration-service/pkg/errdefs"
+	"github.com/goharbor/acceleration-service/pkg/server/util"
 	"github.com/goharbor/acceleration-service/pkg/task"
 	echo "github.com/labstack/echo/v4"
 )
@@ -30,10 +32,7 @@ func (r *LocalRouter) GetTask(ctx echo.Context) error {
 	id := ctx.Param("id")
 	t := task.Manager.Get(id)
 	if t == nil {
-		return ctx.JSON(http.StatusNotFound, map[string]string{
-			"code":    "ERR_TASK_NOT_FOUND",
-			"message": "task not found",
-		})
+		return util.ReplyError(ctx, http.StatusNotFound, errdefs.ErrNotFound, "task not found")
 	}
 	return ctx.JSON(http.StatusOK, t)
 }
